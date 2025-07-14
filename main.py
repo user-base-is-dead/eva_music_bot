@@ -7,17 +7,24 @@ import yt_dlp
 from collections import deque
 import asyncio
 import shutil
-from inactivity_checking import check_for_inactivity
+import logging
+import signal
+import sys
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 
 SONG_QUEUES = {}
 volume_settings = {}
 loop_mode = {}
 is_24_7 = {}
-filters = {}
 current_songs = {}
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -25,16 +32,38 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="`", intents=intents)
 
 
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    print(f"{bot.user} is online!")
+def signal_handler(sig, frame):
+    logging.info("Shutting down bot...")
+    asyncio.run(bot.close())
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+async def check_for_inactivity(channel, bot, is_24_7_mode):
+    try:
+        if is_24_7_mode:
+            return
+        await asyncio.sleep(300) 
+        if (
+            channel.guild.voice_client
+            and not channel.guild.voice_client.is_playing()
+            and not channel.guild.voice_client.is_paused()
+            and not SONG_QUEUES.get(str(channel.guild.id))
+        ):
+            await channel.guild.voice_client.disconnect()
+            await channel.send("Disconnected due to inactivity.")
+    except Exception as e:
+        logging.error(f"Error in check_for_inactivity: {e}")
 
 
 async def search_ytdlp_async(query, ydl_opts):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts))
-
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts))
+    except Exception as e:
+        logging.error(f"yt_dlp error: {e}")
+        return None
 
 def _extract(query, ydl_opts):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -42,27 +71,22 @@ def _extract(query, ydl_opts):
 
 
 async def play_next_song(voice_client, guild_id, channel):
-    if loop_mode.get(guild_id, False) and voice_client.source:
-        voice_client.play(voice_client.source, after=lambda e: asyncio.run_coroutine_threadsafe(
-            play_next_song(voice_client, guild_id, channel), bot.loop))
-        return
-
-    if SONG_QUEUES.get(guild_id) and SONG_QUEUES[guild_id]:
-        audio_url, title = SONG_QUEUES[guild_id].popleft()
-        current_songs[guild_id] = title
-        filter_type = filters.get(guild_id, "none")
-        ffmpeg_options = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn -b:a 256k -ac 2 -ar 48000 -filter:a "
-        }
-        if filter_type == "bassboost":
-            ffmpeg_options["options"] += "equalizer=f=40:width_type=h:width=200:g=10"
-        elif filter_type == "nightcore":
-            ffmpeg_options["options"] += "atempo=1.25,asetrate=44100*1.2"
-        elif filter_type == "8d":
-            ffmpeg_options["options"] += "stereotools=rotation=0.5"
+    try:
+        if loop_mode.get(guild_id, False) and voice_client.source and current_songs.get(guild_id):
+            
+            audio_url, title = current_songs[guild_id]["url"], current_songs[guild_id]["title"]
+        elif SONG_QUEUES.get(guild_id) and SONG_QUEUES[guild_id]:
+            audio_url, title = SONG_QUEUES[guild_id].popleft()
+            current_songs[guild_id] = {"url": audio_url, "title": title}
         else:
-            ffmpeg_options["options"] += "aresample=48000"
+            current_songs.pop(guild_id, None)
+            await check_for_inactivity(channel, bot, is_24_7.get(guild_id, False))
+            return
+
+        ffmpeg_options = {
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 20",
+            "options": "-vn -b:a 256k -ac 2 -ar 48000 -filter:a aresample=48000"
+        }
         ffmpeg_executable = shutil.which("ffmpeg") or "bin\\ffmpeg\\ffmpeg.exe"
         base_audio = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options, executable=ffmpeg_executable)
         volume = volume_settings.get(guild_id, 1.0)
@@ -70,15 +94,43 @@ async def play_next_song(voice_client, guild_id, channel):
 
         def after_play(error):
             if error:
-                print(f"Error playing {title}: {error}")
+                logging.error(f"Error playing {title}: {error}")
             asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel), bot.loop)
 
         voice_client.play(source, after=after_play)
         await channel.send(f"🎶 Now playing: **{title}**")
-    else:
-        current_songs.pop(guild_id, None)
-        await check_for_inactivity(channel, bot, is_24_7.get(guild_id, False))
+    except asyncio.exceptions.CancelledError:
+        logging.info("Playback task cancelled.")
+        return
+    except Exception as e:
+        logging.error(f"Error in play_next_song: {e}")
+        await channel.send("An error occurred while playing the next song.")
 
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    logging.info(f"{bot.user} is online!")
+
+async def connect_to_voice(voice_channel, voice_client):
+    max_retries = 4
+    base_delay = 5
+    for attempt in range(max_retries):
+        try:
+            if voice_client is None:
+                voice_client = await voice_channel.connect(timeout=60.0, reconnect=True)
+            elif voice_channel != voice_client.channel:
+                await voice_client.move_to(voice_channel)
+            return voice_client
+        except discord.errors.ConnectionClosed as e:
+            logging.error(f"ConnectionClosed (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+            else:
+                raise
+        except Exception as e:
+            logging.error(f"Join error (attempt {attempt + 1}/{max_retries}): {e}")
+            raise
 
 @bot.tree.command(name="play", description="Play a song from YouTube link or search query.")
 @app_commands.describe(song_query="YouTube link or search term")
@@ -92,12 +144,10 @@ async def play(interaction: discord.Interaction, song_query: str):
     voice_client = interaction.guild.voice_client
 
     try:
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-            volume_settings[str(interaction.guild_id)] = 1.0
-        elif voice_channel != voice_client.channel:
-            await voice_client.move_to(voice_channel)
-    except:
+        voice_client = await connect_to_voice(voice_channel, voice_client)
+        volume_settings[str(interaction.guild_id)] = 1.0
+    except Exception as e:
+        logging.error(f"Failed to connect: {e}")
         return await interaction.followup.send("Unable to connect to your voice channel.")
 
     if "youtube.com/watch" in song_query or "youtu.be/" in song_query:
@@ -115,7 +165,13 @@ async def play(interaction: discord.Interaction, song_query: str):
         "youtube_include_hls_manifest": False,
     }
 
-    results = await search_ytdlp_async(query, ydl_options)
+    try:
+        results = await search_ytdlp_async(query, ydl_options)
+        if not results:
+            return await interaction.followup.send("Failed to fetch song data.")
+    except Exception as e:
+        logging.error(f"yt_dlp error: {e}")
+        return await interaction.followup.send("Failed to fetch song data.")
 
     if "entries" in results:
         tracks = results.get("entries") or []
@@ -138,7 +194,6 @@ async def play(interaction: discord.Interaction, song_query: str):
     else:
         await play_next_song(voice_client, guild_id, interaction.channel)
 
-
 @bot.tree.command(name="pause", description="Pause the currently playing song.")
 async def pause(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
@@ -149,7 +204,6 @@ async def pause(interaction: discord.Interaction):
             await check_for_inactivity(interaction.channel, bot, is_24_7.get(str(interaction.guild_id), False))
     else:
         await interaction.response.send_message("Nothing is currently playing.")
-
 
 @bot.tree.command(name="resume", description="Resume the currently paused song.")
 async def resume(interaction: discord.Interaction):
@@ -162,7 +216,6 @@ async def resume(interaction: discord.Interaction):
         if vc and not vc.is_playing() and not SONG_QUEUES.get(str(interaction.guild_id)):
             await check_for_inactivity(interaction.channel, bot, is_24_7.get(str(interaction.guild_id), False))
 
-
 @bot.tree.command(name="skip", description="Skips the current playing song.")
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
@@ -174,7 +227,6 @@ async def skip(interaction: discord.Interaction):
         if vc and not vc.is_playing() and not SONG_QUEUES.get(str(interaction.guild_id)):
             await check_for_inactivity(interaction.channel, bot, is_24_7.get(str(interaction.guild_id), False))
 
-
 @bot.tree.command(name="disconnect", description="Stop playback and disconnect.")
 async def disconnect(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
@@ -183,13 +235,11 @@ async def disconnect(interaction: discord.Interaction):
         SONG_QUEUES[guild_id] = deque()
         volume_settings.pop(guild_id, None)
         is_24_7.pop(guild_id, None)
-        filters.pop(guild_id, None)
         current_songs.pop(guild_id, None)
         await vc.disconnect()
         await interaction.response.send_message("👋 Disconnected and cleared the queue.")
     else:
         await interaction.response.send_message("I'm not connected to any voice channel.")
-
 
 @bot.tree.command(name="join", description="Make the bot join your voice channel.")
 async def join(interaction: discord.Interaction):
@@ -198,7 +248,7 @@ async def join(interaction: discord.Interaction):
         return
 
     try:
-        vc = await interaction.user.voice.channel.connect()
+        vc = await connect_to_voice(interaction.user.voice.channel, interaction.guild.voice_client)
         volume_settings[str(interaction.guild_id)] = 1.0
         bitrate = interaction.user.voice.channel.bitrate // 1000
         if bitrate < 128:
@@ -210,9 +260,8 @@ async def join(interaction: discord.Interaction):
         if not vc.is_playing() and not SONG_QUEUES.get(str(interaction.guild_id)):
             await check_for_inactivity(interaction.channel, bot, is_24_7.get(str(interaction.guild_id), False))
     except Exception as e:
-        print(f"Join command error: {e}")
+        logging.error(f"Join command error: {e}")
         await interaction.response.send_message("❌ Failed to join voice channel.")
-
 
 @bot.tree.command(name="queue", description="View current song queue.")
 async def view_queue(interaction: discord.Interaction):
@@ -226,7 +275,6 @@ async def view_queue(interaction: discord.Interaction):
         lines = [f"{i+1}. {t}" for i, (_, t) in enumerate(q)]
         await interaction.response.send_message("🎶 Queue:\n" + "\n".join(lines))
 
-
 @bot.tree.command(name="cleanqueue", description="Clear the entire queue.")
 async def cleanqueue(interaction: discord.Interaction):
     gid = str(interaction.guild_id)
@@ -235,7 +283,6 @@ async def cleanqueue(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and not vc.is_playing():
         await check_for_inactivity(interaction.channel, bot, is_24_7.get(gid, False))
-
 
 @bot.tree.command(name="volume", description="Set volume between 0 and 200.")
 @app_commands.describe(amount="Volume percentage 0-200")
@@ -251,7 +298,6 @@ async def volume(interaction: discord.Interaction, amount: int):
     if vc and not vc.is_playing() and not SONG_QUEUES.get(vid):
         await check_for_inactivity(interaction.channel, bot, is_24_7.get(vid, False))
 
-
 @bot.tree.command(name="loop", description="Toggle loop (repeat current song).")
 async def loop(interaction: discord.Interaction):
     gid = str(interaction.guild_id)
@@ -260,7 +306,6 @@ async def loop(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and not vc.is_playing() and not SONG_QUEUES.get(gid):
         await check_for_inactivity(interaction.channel, bot, is_24_7.get(gid, False))
-
 
 @bot.tree.command(name="nowplaying", description="Show current playing song.")
 async def nowplaying(interaction: discord.Interaction):
@@ -271,25 +316,8 @@ async def nowplaying(interaction: discord.Interaction):
         if vc and not SONG_QUEUES.get(guild_id):
             await check_for_inactivity(interaction.channel, bot, is_24_7.get(guild_id, False))
     else:
-        title = current_songs.get(guild_id, "Unknown")
+        title = current_songs.get(guild_id, {}).get("title", "Unknown")
         await interaction.response.send_message(f"🎵 Currently playing: **{title}**")
-
-
-# @bot.tree.command(name="filter", description="Apply audio filters (bassboost, nightcore, 8d, none).")
-# @app_commands.describe(filter_type="Filter type: bassboost, nightcore, 8d, none")
-# async def apply_filter(interaction: discord.Interaction, filter_type: str):
-#     gid = str(interaction.guild_id)
-#     if filter_type.lower() not in ["bassboost", "nightcore", "8d", "none"]:
-#         await interaction.response.send_message("❌ Invalid filter. Use bassboost, nightcore, 8d, or none.")
-#         return
-#     filters[gid] = filter_type.lower()
-#     vc = interaction.guild.voice_client
-#     if vc and vc.is_playing():
-#         vc.stop()
-#         await interaction.response.send_message(f"🎛️ Applied {filter_type} filter.")
-#     else:
-#         await interaction.response.send_message(f"🎛️ {filter_type} filter set for next song.")
-
 
 @bot.tree.command(name="247", description="Toggle 24/7 mode to keep bot in VC.")
 async def toggle_247(interaction: discord.Interaction):
@@ -300,8 +328,6 @@ async def toggle_247(interaction: discord.Interaction):
     )
     if not is_24_7.get(gid) and not SONG_QUEUES.get(gid) and interaction.guild.voice_client:
         await check_for_inactivity(interaction.channel, bot, is_24_7.get(gid, False))
-
-
 
 async def volume_prefix(ctx, amount: int):
     try:
@@ -319,7 +345,6 @@ async def volume_prefix(ctx, amount: int):
     if vc and not vc.is_playing() and not SONG_QUEUES.get(vid):
         await check_for_inactivity(ctx.channel, bot, is_24_7.get(vid, False))
 
-
 async def play_prefix(ctx, query):
     try:
         await ctx.message.delete()
@@ -332,12 +357,10 @@ async def play_prefix(ctx, query):
     voice_client = ctx.voice_client
 
     try:
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-            volume_settings[str(ctx.guild.id)] = 1.0
-        elif voice_channel != voice_client.channel:
-            await voice_client.move_to(voice_channel)
-    except:
+        voice_client = await connect_to_voice(voice_channel, voice_client)
+        volume_settings[str(ctx.guild.id)] = 1.0
+    except Exception as e:
+        logging.error(f"Failed to connect: {e}")
         return await ctx.send("Unable to connect to your voice channel.")
 
     if "youtube.com/watch" in query or "youtu.be/" in query:
@@ -355,7 +378,14 @@ async def play_prefix(ctx, query):
         "youtube_include_hls_manifest": False,
     }
 
-    results = await search_ytdlp_async(search, ydl_options)
+    try:
+        results = await search_ytdlp_async(search, ydl_options)
+        if not results:
+            return await ctx.send("Failed to fetch song data.")
+    except Exception as e:
+        logging.error(f"yt_dlp error: {e}")
+        return await ctx.send("Failed to fetch song data.")
+
     if "entries" in results:
         tracks = results.get("entries") or []
         if not tracks:
@@ -376,7 +406,6 @@ async def play_prefix(ctx, query):
     else:
         await play_next_song(voice_client, gid, ctx.channel)
 
-
 async def pause_prefix(ctx):
     try:
         await ctx.message.delete()
@@ -390,7 +419,6 @@ async def pause_prefix(ctx):
             await check_for_inactivity(ctx.channel, bot, is_24_7.get(str(ctx.guild.id), False))
     else:
         await ctx.send("Nothing is currently playing.")
-
 
 async def resume_prefix(ctx):
     try:
@@ -406,7 +434,6 @@ async def resume_prefix(ctx):
         if vc and not vc.is_playing() and not SONG_QUEUES.get(str(ctx.guild.id)):
             await check_for_inactivity(ctx.channel, bot, is_24_7.get(str(ctx.guild.id), False))
 
-
 async def skip_prefix(ctx):
     try:
         await ctx.message.delete()
@@ -421,7 +448,6 @@ async def skip_prefix(ctx):
         if vc and not vc.is_playing() and not SONG_QUEUES.get(str(ctx.guild.id)):
             await check_for_inactivity(ctx.channel, bot, is_24_7.get(str(ctx.guild.id), False))
 
-
 async def disconnect_prefix(ctx):
     try:
         await ctx.message.delete()
@@ -433,13 +459,11 @@ async def disconnect_prefix(ctx):
         SONG_QUEUES[guild_id] = deque()
         volume_settings.pop(guild_id, None)
         is_24_7.pop(guild_id, None)
-        filters.pop(guild_id, None)
         current_songs.pop(guild_id, None)
         await vc.disconnect()
         await ctx.send("👋 Disconnected and cleared the queue.")
     else:
         await ctx.send("I'm not connected to any voice channel.")
-
 
 async def join_prefix(ctx):
     try:
@@ -449,7 +473,7 @@ async def join_prefix(ctx):
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await ctx.send("You must be in a voice channel.")
     try:
-        vc = await ctx.author.voice.channel.connect()
+        vc = await connect_to_voice(ctx.author.voice.channel, ctx.voice_client)
         volume_settings[str(ctx.guild.id)] = 1.0
         bitrate = ctx.author.voice.channel.bitrate // 1000
         if bitrate < 128:
@@ -460,9 +484,9 @@ async def join_prefix(ctx):
             await ctx.send("✅ Joined your voice channel.")
         if not vc.is_playing() and not SONG_QUEUES.get(str(ctx.guild.id)):
             await check_for_inactivity(ctx.channel, bot, is_24_7.get(str(ctx.guild.id), False))
-    except:
+    except Exception as e:
+        logging.error(f"Join command error: {e}")
         await ctx.send("❌ Failed to join voice channel.")
-
 
 async def queue_prefix(ctx):
     try:
@@ -479,7 +503,6 @@ async def queue_prefix(ctx):
         lines = [f"{i+1}. {t}" for i, (_, t) in enumerate(q)]
         await ctx.send("🎶 Queue:\n" + "\n".join(lines))
 
-
 async def cleanqueue_prefix(ctx):
     try:
         await ctx.message.delete()
@@ -491,7 +514,6 @@ async def cleanqueue_prefix(ctx):
     vc = ctx.voice_client
     if vc and not vc.is_playing():
         await check_for_inactivity(ctx.channel, bot, is_24_7.get(gid, False))
-
 
 async def nowplaying_prefix(ctx):
     try:
@@ -505,27 +527,20 @@ async def nowplaying_prefix(ctx):
         if vc and not SONG_QUEUES.get(guild_id):
             await check_for_inactivity(ctx.channel, bot, is_24_7.get(guild_id, False))
     else:
-        title = current_songs.get(guild_id, "Unknown")
+        title = current_songs.get(guild_id, {}).get("title", "Unknown")
         await ctx.send(f"🎵 Currently playing: **{title}**")
 
-
-async def filter_prefix(ctx, filter_type: str):
+async def loop_prefix(ctx):
     try:
         await ctx.message.delete()
     except discord.Forbidden:
         await ctx.send("⚠️ I don’t have permission to delete your message.")
     gid = str(ctx.guild.id)
-    if filter_type.lower() not in ["bassboost", "nightcore", "8d", "none"]:
-        await ctx.send("❌ Invalid filter. Use bassboost, nightcore, 8d, or none.")
-        return
-    filters[gid] = filter_type.lower()
+    loop_mode[gid] = not loop_mode.get(gid, False)
+    await ctx.send("🔁 Loop enabled." if loop_mode[gid] else "➡️ Loop disabled.")
     vc = ctx.voice_client
-    if vc and vc.is_playing():
-        vc.stop()
-        await ctx.send(f"🎛️ Applied {filter_type} filter.")
-    else:
-        await ctx.send(f"🎛️ {filter_type} filter set for next song.")
-
+    if vc and not vc.is_playing() and not SONG_QUEUES.get(gid):
+        await check_for_inactivity(ctx.channel, bot, is_24_7.get(gid, False))
 
 async def toggle_247_prefix(ctx):
     try:
@@ -537,7 +552,6 @@ async def toggle_247_prefix(ctx):
     await ctx.send("🔄 24/7 mode enabled." if is_24_7[gid] else "🔄 24/7 mode disabled.")
     if not is_24_7.get(gid) and not SONG_QUEUES.get(gid) and ctx.voice_client:
         await check_for_inactivity(ctx.channel, bot, is_24_7.get(gid, False))
-
 
 @bot.event
 async def on_message(message):
@@ -572,9 +586,12 @@ async def on_message(message):
             await ctx.send("❌ Provide a number between 0 and 200.")
     elif command == "nowplaying":
         await nowplaying_prefix(ctx)
-    elif command == "filter":
-        await filter_prefix(ctx, arg)
+    elif command == "loop":
+        await loop_prefix(ctx)
     elif command == "247":
         await toggle_247_prefix(ctx)
 
-bot.run(TOKEN)
+try:
+    bot.run(TOKEN)
+except Exception as e:
+    logging.error(f"Bot failed to start: {e}")
