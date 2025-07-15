@@ -163,6 +163,8 @@ async def play(interaction: discord.Interaction, song_query: str):
         "source_address": "0.0.0.0",
         "youtube_include_dash_manifest": False,
         "youtube_include_hls_manifest": False,
+        "geo_bypass": True,
+        "proxy": "http://your_proxy_here"
     }
 
     try:
