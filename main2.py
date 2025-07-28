@@ -157,7 +157,6 @@ async def play(interaction: discord.Interaction, song_query: str):
 
     ydl_options = {
         "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/best",
-        "cookiefile": "cookies.txt",
         "quiet": True,
         "default_search": "auto",
         "noplaylist": True,
@@ -165,7 +164,7 @@ async def play(interaction: discord.Interaction, song_query: str):
         "youtube_include_dash_manifest": False,
         "youtube_include_hls_manifest": False,
         "geo_bypass": True,
-    
+        "proxy": "None",
     }
 
     try:
@@ -373,7 +372,6 @@ async def play_prefix(ctx, query):
 
     ydl_options = {
         "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/best",
-        "cookiefile": "cookies.txt",
         "quiet": True,
         "default_search": "auto",
         "noplaylist": True,
