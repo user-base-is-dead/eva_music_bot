@@ -18,6 +18,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_COOKIES_PATH = os.path.join(_BASE_DIR, "cookies.txt")
+
+
+def _ytdlp_opts(extra=None):
+    opts = {
+        "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/best",
+        "quiet": True,
+        "default_search": "auto",
+        "noplaylist": True,
+        "source_address": "0.0.0.0",
+        "youtube_include_dash_manifest": False,
+        "youtube_include_hls_manifest": False,
+        "geo_bypass": True,
+    }
+    if extra:
+        opts.update(extra)
+    if os.path.isfile(_COOKIES_PATH):
+        opts["cookiefile"] = _COOKIES_PATH
+    return opts
+
 
 SONG_QUEUES = {}
 volume_settings = {}
@@ -34,10 +55,15 @@ bot = commands.Bot(command_prefix="`", intents=intents)
 
 def signal_handler(sig, frame):
     logging.info("Shutting down bot...")
-    asyncio.run(bot.close())
+    loop = bot.loop
+    if loop and loop.is_running():
+        asyncio.run_coroutine_threadsafe(bot.close(), loop)
+    else:
+        asyncio.run(bot.close())
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or os.path.join(_BASE_DIR, "bin", "ffmpeg", "ffmpeg.exe")
 
 
 async def check_for_inactivity(channel, bot, is_24_7_mode):
@@ -72,8 +98,7 @@ def _extract(query, ydl_opts):
 
 async def play_next_song(voice_client, guild_id, channel):
     try:
-        if loop_mode.get(guild_id, False) and voice_client.source and current_songs.get(guild_id):
-            
+        if loop_mode.get(guild_id, False) and current_songs.get(guild_id):
             audio_url, title = current_songs[guild_id]["url"], current_songs[guild_id]["title"]
         elif SONG_QUEUES.get(guild_id) and SONG_QUEUES[guild_id]:
             audio_url, title = SONG_QUEUES[guild_id].popleft()
@@ -87,8 +112,7 @@ async def play_next_song(voice_client, guild_id, channel):
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 20",
             "options": "-vn -b:a 256k -ac 2 -ar 48000 -filter:a aresample=48000"
         }
-        ffmpeg_executable = shutil.which("ffmpeg") or "bin\\ffmpeg\\ffmpeg.exe"
-        base_audio = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options, executable=ffmpeg_executable)
+        base_audio = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options, executable=FFMPEG_EXECUTABLE)
         volume = volume_settings.get(guild_id, 1.0)
         source = discord.PCMVolumeTransformer(base_audio, volume=volume)
 
@@ -99,7 +123,7 @@ async def play_next_song(voice_client, guild_id, channel):
 
         voice_client.play(source, after=after_play)
         await channel.send(f"🎶 Now playing: **{title}**")
-    except asyncio.exceptions.CancelledError:
+    except asyncio.CancelledError:
         logging.info("Playback task cancelled.")
         return
     except Exception as e:
@@ -155,18 +179,7 @@ async def play(interaction: discord.Interaction, song_query: str):
     else:
         query = "ytsearch:" + song_query
 
-    ydl_options = {
-        "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/best",
-        "cookiefile": "cookies.txt",
-        "quiet": True,
-        "default_search": "auto",
-        "noplaylist": True,
-        "source_address": "0.0.0.0",
-        "youtube_include_dash_manifest": False,
-        "youtube_include_hls_manifest": False,
-        "geo_bypass": True,
-    
-    }
+    ydl_options = _ytdlp_opts()
 
     try:
         results = await search_ytdlp_async(query, ydl_options)
@@ -195,6 +208,7 @@ async def play(interaction: discord.Interaction, song_query: str):
     if voice_client.is_playing() or voice_client.is_paused():
         await interaction.followup.send(f"Added to queue: **{title}**")
     else:
+        await interaction.followup.send(f"🎵 Starting playback: **{title}**")
         await play_next_song(voice_client, guild_id, interaction.channel)
 
 @bot.tree.command(name="pause", description="Pause the currently playing song.")
@@ -281,7 +295,8 @@ async def view_queue(interaction: discord.Interaction):
 @bot.tree.command(name="cleanqueue", description="Clear the entire queue.")
 async def cleanqueue(interaction: discord.Interaction):
     gid = str(interaction.guild_id)
-    SONG_QUEUES.get(gid, deque()).clear()
+    if gid in SONG_QUEUES:
+        SONG_QUEUES[gid].clear()
     await interaction.response.send_message("🧹 Queue has been cleared!")
     vc = interaction.guild.voice_client
     if vc and not vc.is_playing():
@@ -371,16 +386,7 @@ async def play_prefix(ctx, query):
     else:
         search = "ytsearch:" + query
 
-    ydl_options = {
-        "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/best",
-        "cookiefile": "cookies.txt",
-        "quiet": True,
-        "default_search": "auto",
-        "noplaylist": True,
-        "source_address": "0.0.0.0",
-        "youtube_include_dash_manifest": False,
-        "youtube_include_hls_manifest": False,
-    }
+    ydl_options = _ytdlp_opts()
 
     try:
         results = await search_ytdlp_async(search, ydl_options)
@@ -513,7 +519,8 @@ async def cleanqueue_prefix(ctx):
     except discord.Forbidden:
         await ctx.send("⚠️ I don’t have permission to delete your message.")
     gid = str(ctx.guild.id)
-    SONG_QUEUES.get(gid, deque()).clear()
+    if gid in SONG_QUEUES:
+        SONG_QUEUES[gid].clear()
     await ctx.send("🧹 Queue has been cleared!")
     vc = ctx.voice_client
     if vc and not vc.is_playing():
@@ -594,6 +601,12 @@ async def on_message(message):
         await loop_prefix(ctx)
     elif command == "247":
         await toggle_247_prefix(ctx)
+
+if not TOKEN:
+    logging.error(
+        "DISCORD_TOKEN is missing. Set it in .env (same folder as main.py) or in the environment."
+    )
+    sys.exit(1)
 
 try:
     bot.run(TOKEN)
