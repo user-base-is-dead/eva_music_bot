@@ -8,6 +8,7 @@ from collections import deque
 import asyncio
 import importlib.util
 import shutil
+import subprocess
 import logging
 import signal
 import sys
@@ -69,6 +70,53 @@ def validate_voice_dependencies():
         sys.exit(1)
 
 
+def resolve_ffmpeg_executable():
+    env_path = os.getenv("FFMPEG_PATH")
+    if env_path:
+        if os.path.isfile(env_path) or shutil.which(env_path):
+            return env_path
+        logging.warning("FFMPEG_PATH is set but was not found: %s", env_path)
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    local_binary = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    local_path = os.path.join(_BASE_DIR, "bin", "ffmpeg", local_binary)
+    if os.path.isfile(local_path):
+        return local_path
+
+    return None
+
+
+def validate_ffmpeg_dependency():
+    if not FFMPEG_EXECUTABLE:
+        if os.name == "nt":
+            install_hint = "Install FFmpeg or place ffmpeg.exe in bin\\ffmpeg."
+        else:
+            install_hint = "Install FFmpeg on the server, for example: sudo apt update && sudo apt install -y ffmpeg"
+
+        logging.error("FFmpeg executable not found. %s", install_hint)
+        sys.exit(1)
+
+    try:
+        subprocess.run(
+            [FFMPEG_EXECUTABLE, "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=10,
+        )
+    except PermissionError:
+        logging.error("FFmpeg is not executable: %s", FFMPEG_EXECUTABLE)
+        sys.exit(1)
+    except (OSError, subprocess.SubprocessError) as e:
+        logging.error("FFmpeg could not be started from %s: %s", FFMPEG_EXECUTABLE, e)
+        sys.exit(1)
+
+    logging.info("Using FFmpeg executable: %s", FFMPEG_EXECUTABLE)
+
+
 def signal_handler(sig, frame):
     logging.info("Shutting down bot...")
     loop = bot.loop
@@ -79,7 +127,7 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
-FFMPEG_EXECUTABLE = shutil.which("ffmpeg") or os.path.join(_BASE_DIR, "bin", "ffmpeg", "ffmpeg.exe")
+FFMPEG_EXECUTABLE = resolve_ffmpeg_executable()
 
 
 async def check_for_inactivity(channel, bot, is_24_7_mode):
@@ -625,6 +673,7 @@ if not TOKEN:
     sys.exit(1)
 
 validate_voice_dependencies()
+validate_ffmpeg_dependency()
 
 try:
     bot.run(TOKEN)
