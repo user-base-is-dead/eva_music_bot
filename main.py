@@ -24,10 +24,24 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _COOKIES_PATH = os.path.join(_BASE_DIR, "cookies.txt")
 
 
+def resolve_ytdlp_js_runtimes():
+    runtimes = {}
+    for runtime_name in ("deno", "node", "quickjs", "bun"):
+        runtime_path = shutil.which(runtime_name)
+        if runtime_path:
+            runtimes[runtime_name] = {"path": runtime_path}
+
+    return runtimes
+
+
+YTDLP_JS_RUNTIMES = resolve_ytdlp_js_runtimes()
+
+
 def _ytdlp_opts(extra=None):
     opts = {
         "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/best",
         "quiet": True,
+        "no_warnings": True,
         "default_search": "auto",
         "noplaylist": True,
         "source_address": "0.0.0.0",
@@ -35,6 +49,8 @@ def _ytdlp_opts(extra=None):
         "youtube_include_hls_manifest": False,
         "geo_bypass": True,
     }
+    if YTDLP_JS_RUNTIMES:
+        opts["js_runtimes"] = YTDLP_JS_RUNTIMES
     if extra:
         opts.update(extra)
     if os.path.isfile(_COOKIES_PATH):
@@ -117,6 +133,16 @@ def validate_ffmpeg_dependency():
     logging.info("Using FFmpeg executable: %s", FFMPEG_EXECUTABLE)
 
 
+def validate_ytdlp_js_runtime():
+    if YTDLP_JS_RUNTIMES:
+        logging.info("yt-dlp JavaScript runtime available: %s", ", ".join(YTDLP_JS_RUNTIMES))
+        return
+
+    logging.warning(
+        "No yt-dlp JavaScript runtime found. YouTube may still play, but install deno or node on the server to avoid degraded extraction."
+    )
+
+
 def signal_handler(sig, frame):
     logging.info("Shutting down bot...")
     loop = bot.loop
@@ -173,10 +199,15 @@ async def play_next_song(voice_client, guild_id, channel):
             return
 
         ffmpeg_options = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 20",
-            "options": "-vn -b:a 256k -ac 2 -ar 48000 -filter:a aresample=48000"
+            "before_options": "-nostdin -hide_banner -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 20",
+            "options": "-vn",
         }
-        base_audio = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options, executable=FFMPEG_EXECUTABLE)
+        base_audio = discord.FFmpegPCMAudio(
+            audio_url,
+            **ffmpeg_options,
+            executable=FFMPEG_EXECUTABLE,
+            stderr=subprocess.DEVNULL,
+        )
         volume = volume_settings.get(guild_id, 1.0)
         source = discord.PCMVolumeTransformer(base_audio, volume=volume)
 
@@ -674,6 +705,7 @@ if not TOKEN:
 
 validate_voice_dependencies()
 validate_ffmpeg_dependency()
+validate_ytdlp_js_runtime()
 
 try:
     bot.run(TOKEN)
