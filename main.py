@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import yt_dlp
 from collections import deque
 import asyncio
+import importlib.util
 import shutil
 import logging
 import signal
@@ -51,6 +52,21 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="`", intents=intents)
+
+
+def validate_voice_dependencies():
+    missing = []
+    for module_name, package_name in (("nacl", "PyNaCl"), ("davey", "davey")):
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(package_name)
+
+    if missing:
+        logging.error(
+            "Missing Discord voice dependency: %s. Install with: \"%s\" -m pip install -r requirements.txt",
+            ", ".join(missing),
+            sys.executable,
+        )
+        sys.exit(1)
 
 
 def signal_handler(sig, frame):
@@ -607,6 +623,8 @@ if not TOKEN:
         "DISCORD_TOKEN is missing. Set it in .env (same folder as main.py) or in the environment."
     )
     sys.exit(1)
+
+validate_voice_dependencies()
 
 try:
     bot.run(TOKEN)
